@@ -415,6 +415,138 @@ Example format: `BRGY-202610-0001`
 
 **Important implementation note:** The function currently calculates the next number using `COUNT(*) + 1`. Concurrent requests may calculate the same number, and deleted records can affect the next value. A database sequence or another concurrency-safe allocation method is recommended before production use. The unique constraint on `tracking_number` helps reject duplicate values but does not prevent allocation conflicts.
 
+### 10.3 `fn_get_user_password_hash(p_user_id UUID)`
+
+**Return type:** `TABLE(password_hash VARCHAR)`
+
+**Volatility:** `STABLE`
+
+**Purpose:** Securely retrieves the current password hash of a user for verification (e.g., verifying the current password before authorizing a password change or sensitive account modification).
+
+**Inputs:**
+- `p_user_id` (UUID): The unique identifier of the user (`users.id`).
+
+**Returned Columns:**
+| Column | Data Type | Description |
+|---|---|---|
+| `password_hash` | VARCHAR | The stored bcrypt password hash |
+
+**SQL Definition:**
+
+```sql
+CREATE OR REPLACE FUNCTION fn_get_user_password_hash(p_user_id UUID)
+RETURNS TABLE (
+    password_hash VARCHAR
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT u.password_hash
+    FROM users u
+    WHERE u.id = p_user_id;
+END;
+$$ LANGUAGE plpgsql STABLE;
+```
+
+**Process:**
+1. Accepts the target user's UUID.
+2. Queries the `users` table for a record matching `u.id = p_user_id`.
+3. Returns a single-column result set containing the stored password hash.
+4. Returns an empty result set if no user matches the given ID.
+
+**Example use:**
+
+```sql
+SELECT password_hash 
+FROM barangay.fn_get_user_password_hash('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID);
+```
+
+**Security & Design Rationale:**
+- **Information Hiding:** Only extracts the `password_hash` column rather than the entire user record, keeping personally identifiable information (PII) and role information separate from verification routines.
+- **Transactional Stability:** Declared `STABLE` because it does not modify database state and returns identical results for the same arguments within a single table scan or transaction.
+
+### 10.4 `fn_get_user_profile(p_user_id UUID)`
+
+**Return type:** `TABLE(...)` (16 columns combining user credentials and demographic details)
+
+**Volatility:** `STABLE`
+
+**Purpose:** Retrieves the complete consolidated profile for a given user account by performing a `LEFT JOIN` between `users` and `residents`.
+
+**Inputs:**
+- `p_user_id` (UUID): The unique identifier of the user (`users.id`).
+
+**Returned Columns:**
+| Column Name | Data Type | Nullable | Source Table | Description |
+|---|---|---|---|---|
+| `id` | UUID | No | `users.id` | User account primary key |
+| `email` | VARCHAR | No | `users.email` | User registered email address |
+| `role` | `user_role` | No | `users.role` | System access role (`Administrator`, `Barangay Staff`, `Resident`) |
+| `is_active` | BOOLEAN | Yes | `users.is_active` | Account active flag |
+| `created_at` | TIMESTAMPTZ | Yes | `users.created_at` | Account creation timestamp |
+| `resident_id` | UUID | Yes | `residents.id` | Linked resident profile primary key (NULL if unlinked) |
+| `first_name` | VARCHAR | Yes | `residents.first_name` | Resident first name |
+| `middle_name` | VARCHAR | Yes | `residents.middle_name` | Resident middle name |
+| `last_name` | VARCHAR | Yes | `residents.last_name` | Resident last name |
+| `suffix` | VARCHAR | Yes | `residents.suffix` | Name suffix (e.g., Jr., III) |
+| `birthdate` | DATE | Yes | `residents.birthdate` | Date of birth |
+| `gender` | VARCHAR | Yes | `residents.gender` | Gender (`Male`, `Female`, `Other`) |
+| `civil_status` | `civil_status` | Yes | `residents.civil_status` | Civil status (`Single`, `Married`, `Widowed`, etc.) |
+| `purok_zone` | VARCHAR | Yes | `residents.purok_zone` | Purok or zone assignment |
+| `address_line` | TEXT | Yes | `residents.address_line` | Full residential address |
+| `contact_number`| VARCHAR | Yes | `residents.contact_number` | Contact telephone/mobile number |
+
+**SQL Definition:**
+
+```sql
+CREATE OR REPLACE FUNCTION fn_get_user_profile(p_user_id UUID)
+RETURNS TABLE (
+    id UUID,
+    email VARCHAR,
+    role user_role,
+    is_active BOOLEAN,
+    created_at TIMESTAMP WITH TIME ZONE,
+    resident_id UUID,
+    first_name VARCHAR,
+    middle_name VARCHAR,
+    last_name VARCHAR,
+    suffix VARCHAR,
+    birthdate DATE,
+    gender VARCHAR,
+    civil_status civil_status,
+    purok_zone VARCHAR,
+    address_line TEXT,
+    contact_number VARCHAR
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT u.id, u.email, u.role, u.is_active, u.created_at,
+           r.id AS resident_id, r.first_name, r.middle_name, r.last_name, r.suffix,
+           r.birthdate, r.gender, r.civil_status,
+           r.purok_zone, r.address_line, r.contact_number
+    FROM users u
+    LEFT JOIN residents r ON u.id = r.user_id
+    WHERE u.id = p_user_id;
+END;
+$$ LANGUAGE plpgsql STABLE;
+```
+
+**Process:**
+1. Accepts the target user's UUID.
+2. Joins `users u` with `residents r` using `LEFT JOIN residents r ON u.id = r.user_id`.
+3. Filters by `WHERE u.id = p_user_id`.
+4. Returns the single consolidated profile record.
+
+**Example use:**
+
+```sql
+SELECT * 
+FROM barangay.fn_get_user_profile('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID);
+```
+
+**Key Architectural & Security Considerations:**
+- **Zero Credential Exposure:** Noticeably omits `password_hash` from the output columns, ensuring that API endpoints fetching user profiles (e.g., `GET /api/v1/auth/profile` or `/me`) can safely return the result without risk of leaking credential hashes.
+- **Graceful Unlinked Profile Handling (`LEFT JOIN`):** Administrative or staff users without a linked `residents` record still return account metadata with resident demographic fields safely set to `NULL`.
+
 ## 11. Stored Procedures
 
 ### 11.1 `sp_register_resident_user(...)`
@@ -444,7 +576,52 @@ Example format: `BRGY-202610-0001`
 
 Both inserts execute within the procedure call's transaction context when called normally as a single statement. If an error causes the statement to fail, both changes are rolled back.
 
-### 11.2 `sp_update_request_status(...)`
+### 11.2 `sp_change_user_password(...)`
+
+**Purpose:** Updates a user's stored password hash and automatically refreshes the account's `updated_at` modification timestamp.
+
+**Parameters:**
+- `p_user_id`: UUID of the user (`users.id`)
+- `p_new_password_hash`: Pre-computed bcrypt password hash (VARCHAR)
+
+**SQL Definition:**
+
+```sql
+CREATE OR REPLACE PROCEDURE sp_change_user_password(
+    p_user_id UUID,
+    p_new_password_hash VARCHAR
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    UPDATE users
+    SET password_hash = p_new_password_hash,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = p_user_id;
+END;
+$$;
+```
+
+**Process:**
+1. Accepts the target user's UUID and pre-computed password hash.
+2. Updates `password_hash` in the `users` table where `id = p_user_id`.
+3. Sets `updated_at` to `CURRENT_TIMESTAMP`.
+4. Completes atomically within the database transaction.
+
+**Example use:**
+
+```sql
+CALL barangay.sp_change_user_password(
+    'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID,
+    '$2b$10$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW'
+);
+```
+
+**Security Notes:**
+- **Pre-hashed Input Required:** Plain-text passwords must never be passed to this procedure. The application backend must hash the plain-text password using a secure algorithm (e.g., bcrypt with cost factor >= 10) before calling the procedure.
+- **Workflow Pairing:** Recommended to be executed only after verifying the user's current password against `fn_get_user_password_hash(p_user_id)`.
+
+### 11.3 `sp_update_request_status(...)`
 
 **Purpose:** Updates a document request's status and processing information.
 
